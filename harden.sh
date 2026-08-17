@@ -470,10 +470,24 @@ if ! command -v sudo &>/dev/null; then
     fi
 fi
 
+# Un fichier d'unité systemd peut se trouver à plusieurs emplacements standards selon la
+# distribution (paquet système vs unité locale). On vérifie les trois pour éviter un faux
+# négatif.
+unit_file_exists() {
+    local unit="$1"
+    [[ -f "/lib/systemd/system/$unit" || -f "/usr/lib/systemd/system/$unit" || -f "/etc/systemd/system/$unit" ]]
+}
+
 if command -v systemctl &>/dev/null; then
-    if systemctl list-units --type=service --all 2>/dev/null | awk '$2 == "loaded"' | grep -E -q '\bssh\.service\b'; then
+    # "systemctl list-unit-files" liste tous les fichiers d'unité connus de systemd,
+    # indépendamment de leur état d'exécution au moment précis de l'appel. C'est plus
+    # fiable que de parser "list-units" (dont le format de sortie et le "LOAD state"
+    # peuvent varier juste après une installation/activation selon le système). En
+    # complément, on vérifie aussi directement la présence du fichier d'unité sur le
+    # disque, au cas où systemctl se comporterait différemment sur une distribution donnée.
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -qE '^ssh\.service\b' || unit_file_exists "ssh.service"; then
         SSH_SERVICE="ssh"
-    elif systemctl list-units --type=service --all 2>/dev/null | awk '$2 == "loaded"' | grep -E -q '\bsshd\.service\b'; then
+    elif systemctl list-unit-files --type=service 2>/dev/null | grep -qE '^sshd\.service\b' || unit_file_exists "sshd.service"; then
         SSH_SERVICE="sshd"
     else
         show_error "Impossible de détecter le service SSH. Script interrompu."
