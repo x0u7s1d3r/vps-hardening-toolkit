@@ -188,8 +188,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installer les paquets nécessaires au test (SSH, outils réseau, systemd)
-        run: dnf install -y openssh-server openssh-clients iproute systemd
+      - name: Installer les paquets nécessaires au test (SSH, outils réseau, systemd, diffutils)
+        run: dnf install -y openssh-server openssh-clients iproute systemd diffutils
 
       - name: Générer une clé SSH jetable pour le test
         run: ssh-keygen -t ed25519 -f /tmp/testkey -N "" -C "ci-rhel-test"
@@ -225,7 +225,7 @@ jobs:
       - name: >
           Installer git et les paquets nécessaires (pacman -Syu --needed, cf.
           l'avertissement du script lui-même sur les "partial upgrades" Arch)
-        run: pacman -Syu --noconfirm --needed git openssh iproute2 systemd
+        run: pacman -Syu --noconfirm --needed git openssh iproute2 systemd diffutils
 
       - name: Checkout
         uses: actions/checkout@v4
