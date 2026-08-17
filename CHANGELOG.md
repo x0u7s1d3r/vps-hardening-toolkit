@@ -1,0 +1,55 @@
+# Changelog
+
+Toutes les évolutions notables de ce projet sont documentées ici. Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
+
+## [1.1.0] - 2026-08-17
+
+### Ajouté
+
+- Mode non-interactif scriptable : `--user`, `--ssh-port`, `--allowed-ips`, `--pubkey`, `--disable-ipv6`, `--limit-icmp`, `--sudo-nopasswd`, `--non-interactive`. Permet d'exécuter le script sans aucune question, utilisable en CI ou depuis un outil d'infra-as-code.
+- Mode `--dry-run` : prévisualise toutes les actions (utilisateur, SSH, IPv6/ICMP, firewall, fail2ban) sans modifier le système.
+- `-h` / `--help` : aide complète, utilisable sans droits root.
+- Journalisation automatique de toute l'exécution dans `/var/log/vps-hardening-toolkit.log` (best-effort, ne bloque pas le script si le fichier n'est pas accessible en écriture).
+- Pipeline GitHub Actions (`.github/workflows/ci.yml`) : lint shellcheck sur chaque push/PR, plus un test d'intégration qui exécute réellement le script en mode non-interactif sur un runner Ubuntu et vérifie le résultat (SSH par clé fonctionnel, mot de passe/root désactivés, firewall actif, fail2ban actif).
+- `CHANGELOG.md` (ce fichier).
+
+### Modifié
+
+- La détection des fichiers `sshd_config.d/*.conf` concernés par le durcissement (ex: `50-cloud-init.conf`) est maintenant effectuée même en mode `--dry-run`, pour prévisualiser correctement ce qui serait modifié.
+
+## [1.0.0] - 2026-08-17
+
+Première version publique, entièrement réécrite à partir d'un script de MozzyPC.
+
+### Corrigé (fiabilité / anti-lockout)
+
+- Validation `sshd -t` avant tout redémarrage de sshd (évite de restart une config cassée).
+- `set_sshd_option()` remplace les `sed` fragiles qui ne matchaient que les lignes commentées : applique désormais la valeur que la ligne soit commentée, déjà définie, ou absente.
+- Détection et correction des drop-ins `/etc/ssh/sshd_config.d/*.conf` (ex: `50-cloud-init.conf` sur Ubuntu cloud, qui force `PasswordAuthentication yes` après le fichier principal).
+- `register_action()` appelé avant chaque action risquée (et non après), pour que le rollback fonctionne même si l'action échoue en cours de route.
+- `rollback()` parcourt les actions dans l'ordre inverse (on rouvre le firewall avant de remettre l'ancien port SSH), pour éviter une fenêtre de blocage pendant l'annulation.
+- `trap ERR` désarmé au début de `rollback()` pour éviter une boucle de rollback récursif.
+- `manage_service()` propage désormais le vrai code de retour (avant : toujours "succès").
+
+### Corrigé (portabilité multi-distro)
+
+- Création d'utilisateur adaptée (`adduser` Debian-only vs `useradd`+`passwd -l` ailleurs).
+- Groupe `sudo`/`wheel` détecté selon la distribution (`usermod -aG sudo` cassait sur RHEL-like).
+- Regex de distribution corrigée pour matcher `almalinux` (et pas seulement `alma`).
+- Fail2ban : `logpath` adapté (`auth.log` vs `secure`) ou passage en `backend = systemd` si aucun fichier de log classique n'existe (image cloud minimaliste).
+- Vérification/installation de `sudo` s'il est absent.
+
+### Corrigé (sécurité)
+
+- Plus d'affichage systématique de la clé privée en clair : option de fournir sa propre clé publique (recommandé), sinon affichage seulement sur confirmation explicite, avec commande `scp` fournie pour récupérer la clé proprement.
+- `sudo NOPASSWD` n'est plus la valeur imposée par défaut ; demandé explicitement, avec validation du fichier sudoers via `visudo -cf` et permissions `0440`.
+- `UsePAM` n'est plus désactivé (cassait 2FA/PAM sans bénéfice de sécurité réel).
+- IPv6/ICMP gérés via des fichiers de dépôt `/etc/sysctl.d/` dédiés (idempotents, rollback = suppression du fichier) plutôt que des `echo >>` cumulatifs dans `sysctl.conf`.
+- Sauvegarde des règles UFW existantes avant `reset` si un firewall était déjà actif.
+- Pas de doublons dans `authorized_keys` en cas de ré-exécution du script.
+
+### Corrigé (validation)
+
+- `validate_port`/`is_port_in_use` corrigés (ancrage regex : `":$port"` évite les faux positifs du type port 22 matchant aussi 2222).
+- `validate_yes_no` unifié et insensible à la casse (`oui`/`non`/`o`/`y`/`yes`/`no` acceptés partout).
+- `validate_ip` vérifie désormais que chaque octet est bien entre 0 et 255.

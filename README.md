@@ -1,10 +1,13 @@
 # vps-hardening-toolkit
 
+[![CI](https://github.com/x0u7s1d3r/vps-hardening-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/x0u7s1d3r/vps-hardening-toolkit/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Script bash pour durcir rapidement et correctement un serveur VPS fraîchement installé : utilisateur non-root, SSH par clé uniquement, firewall, fail2ban, et quelques réglages réseau. Pensé pour être le **premier script qu'on lance** sur un VPS tout neuf, avant d'y déployer quoi que ce soit.
 
-Compatible **Debian/Ubuntu**, **RHEL/CentOS/Rocky/AlmaLinux/Fedora** et **Arch Linux**.
+Compatible **Debian/Ubuntu**, **RHEL/CentOS/Rocky/AlmaLinux/Fedora** et **Arch Linux**. Utilisable en mode interactif classique ou entièrement scriptable (`--non-interactive`), avec un mode `--dry-run` pour prévisualiser les changements.
 
-> Un tutoriel pas-à-pas très détaillé (durcissement + hébergement d'un vrai site web dynamique en HTTPS) est disponible dans [`docs/TUTORIEL.md`](docs/TUTORIEL.md).
+> Un tutoriel pas-à-pas très détaillé (durcissement + hébergement d'un vrai site web dynamique en HTTPS) est disponible dans [`docs/TUTORIEL.md`](docs/TUTORIEL.md). L'historique des versions est dans [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Pourquoi ce script
 
@@ -35,6 +38,32 @@ sudo ./harden.sh
 ```
 
 Le script pose des questions à chaque étape (nom d'utilisateur, port SSH, IPs autorisées, etc.) avec des valeurs par défaut raisonnables. **Gardez votre session SSH actuelle ouverte** pendant toute l'exécution : à la fin, le script vous demande de valider la nouvelle connexion depuis une autre fenêtre avant de considérer que tout est bon. Si vous répondez "non", tout est annulé automatiquement.
+
+## Mode avancé : dry-run et non-interactif
+
+```bash
+sudo ./harden.sh --help
+```
+
+- `--dry-run` : affiche tout ce que le script ferait (utilisateur, SSH, firewall, fail2ban) sans toucher au système. Aucune question interactive n'empêche l'aperçu, seules les actions réelles sont sautées.
+- `--non-interactive` avec `--user`, `--ssh-port`, `--allowed-ips`, `--pubkey`, `--disable-ipv6`, `--limit-icmp`, `--sudo-nopasswd` : exécution 100% automatisée, sans aucune question, utilisable en CI ou appelée depuis un autre script/outil d'infra.
+
+Exemple :
+
+```bash
+sudo ./harden.sh --non-interactive \
+  --user deploy \
+  --ssh-port 2222 \
+  --pubkey "$(cat ~/.ssh/id_ed25519.pub)" \
+  --allowed-ips "203.0.113.42" \
+  --disable-ipv6 oui \
+  --limit-icmp oui \
+  --sudo-nopasswd non
+```
+
+Chaque exécution est journalisée dans `/var/log/vps-hardening-toolkit.log`.
+
+Le pipeline CI (`.github/workflows/ci.yml`) fait tourner shellcheck sur chaque push, puis exécute réellement le script en mode non-interactif sur un runner Ubuntu jetable et vérifie le résultat (connexion SSH par clé fonctionnelle, root et mot de passe désactivés, firewall actif, fail2ban actif).
 
 ## Avertissements
 

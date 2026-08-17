@@ -1,0 +1,31 @@
+name: Playground SSH (bac à sable manuel)
+#
+# Ouvre une session SSH interactive sur une VM Ubuntu jetable fournie par GitHub.
+# Se déclenche UNIQUEMENT à la main (workflow_dispatch), jamais sur un push, pour ne
+# pas bloquer le vrai pipeline CI (ci.yml) qui doit rester 100% automatique.
+#
+# Usage :
+#   1. Onglet "Actions" du repo sur GitHub -> "Playground SSH (bac à sable manuel)" -> "Run workflow"
+#   2. Ouvrir le job qui démarre, dérouler l'étape "Session SSH interactive (tmate)"
+#   3. Copier la commande "ssh ..." qui s'affiche dans les logs et la coller dans ton terminal
+#   4. Tu es root/sudo sur une vraie VM Ubuntu fraîche : installe openssh-server, lance
+#      harden.sh à la main, casse ce que tu veux pour apprendre, tout est détruit à la fin.
+#
+# ATTENTION SÉCURITÉ : ce repo est public, donc les logs du job (et la commande SSH
+# affichée dedans) sont visibles par n'importe qui pendant que le job tourne. Ne mets
+# jamais de secret perso dans cette VM, et referme la session dès que t'as fini (ou
+# laisse le timeout ci-dessous le faire pour toi).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  playground:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Session SSH interactive (tmate)
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 60

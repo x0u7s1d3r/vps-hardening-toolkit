@@ -9,14 +9,14 @@
 #   Licence  : MIT (voir LICENSE)
 #   Inspiré du script original de MozzyPC (https://www.youtube.com/@mozzypc),
 #   entièrement revu : idempotence, rollback fiable, compatibilité multi-distro
-#   (Debian/Ubuntu, RHEL/CentOS/Rocky/AlmaLinux/Fedora, Arch), et durcissement
-#   SSH/firewall/fail2ban plus strict. Détail complet des correctifs en bas
-#   de ce fichier et dans docs/TUTORIEL.md.
+#   (Debian/Ubuntu, RHEL/CentOS/Rocky/AlmaLinux/Fedora, Arch), mode
+#   non-interactif scriptable et mode --dry-run. Historique des versions
+#   dans CHANGELOG.md, guide complet dans docs/TUTORIEL.md.
 #
-#   Usage : sudo ./harden.sh
+#   Usage : sudo ./harden.sh [options]   (voir --help)
 # ============================================================================
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 set -e  # Arrête le script en cas d'erreur (voir gestion du trap ERR plus bas)
 set -u  # Erreur si variable non définie utilisée
@@ -30,7 +30,19 @@ SSHD_CONFIG_D="/etc/ssh/sshd_config.d"
 SYSCTL_DROPIN_DIR="/etc/sysctl.d"
 IPV6_DROPIN="$SYSCTL_DROPIN_DIR/90-vps-hardening-ipv6.conf"
 ICMP_DROPIN="$SYSCTL_DROPIN_DIR/90-vps-hardening-icmp.conf"
-SSHD_TOUCHED_FILES=()  # Tous les fichiers sshd_config* réellement modifiés (pour backup/rollback)
+SSHD_TOUCHED_FILES=()  # Tous les fichiers sshd_config* concernés (pour backup/rollback)
+LOG_FILE="/var/log/vps-hardening-toolkit.log"
+
+# CLI / modes d'exécution (voir usage() plus bas)
+DRY_RUN=false
+NON_INTERACTIVE=false
+ARG_USER=""
+ARG_SSH_PORT=""
+ARG_ALLOWED_IPS=""
+ARG_PUBKEY=""
+ARG_DISABLE_IPV6=""
+ARG_LIMIT_ICMP=""
+ARG_SUDO_NOPASSWD=""
 
 # === Ajout de couleurs pour améliorer l'affichage ===
 RED="\033[1;31m"
@@ -62,6 +74,10 @@ show_error() {
     echo -e "${RED}❌ $1${NC}" >&2  # On force l'affichage sur stderr
 }
 
+dry_log() {
+    echo -e "${CYAN}[DRY-RUN]${NC} $1"
+}
+
 # Fonction générique pour demander une entrée utilisateur avec validation
 prompt_user() {
     local prompt_text="$1"
@@ -85,6 +101,70 @@ prompt_user() {
         fi
     done
 }
+
+# En mode --non-interactive : utilise la valeur passée en argument (ou le défaut) sans
+# jamais lire sur stdin, et échoue proprement si la validation ne passe pas.
+# En mode interactif normal : une valeur passée en argument devient simplement la valeur
+# par défaut proposée dans le prompt (qu'on peut toujours changer en répondant).
+resolve_value() {
+    local arg_value="$1" prompt_text="$2" default_value="$3" validate_func="$4" val
+    if $NON_INTERACTIVE; then
+        val="${arg_value:-$default_value}"
+        if [[ -n "$validate_func" ]]; then
+            "$validate_func" "$val" || exit 1
+        fi
+        echo "$val"
+    else
+        prompt_user "$prompt_text" "${arg_value:-$default_value}" "$validate_func"
+    fi
+}
+
+usage() {
+    cat <<USAGE
+vps-hardening-toolkit v${VERSION} - harden.sh
+https://github.com/x0u7s1d3r/vps-hardening-toolkit
+
+Usage : sudo ./harden.sh [options]
+
+Options :
+  --user NOM                   Nom de l'utilisateur à créer (défaut : secureuser)
+  --ssh-port PORT               Port SSH à utiliser (défaut : port aléatoire libre >= 10000)
+  --allowed-ips "IP1 IP2"       IPs/CIDR autorisées pour SSH, séparées par des espaces (défaut : aucune restriction)
+  --pubkey "ssh-ed25519 ..."    Clé publique SSH à installer (défaut : en génère une sur le serveur)
+  --disable-ipv6 oui|non        Désactiver IPv6 (défaut : oui)
+  --limit-icmp oui|non          Limiter les réponses ICMP (défaut : oui)
+  --sudo-nopasswd oui|non       Sudo sans mot de passe pour le nouvel utilisateur (défaut : non)
+  --non-interactive              Ne pose aucune question, utilise les valeurs ci-dessus ou les défauts
+  --dry-run                      N'applique aucun changement, affiche ce qui serait fait
+  -h, --help                     Affiche cette aide
+
+Exemples :
+  sudo ./harden.sh
+      Mode interactif classique (questions à chaque étape).
+
+  sudo ./harden.sh --dry-run
+      Prévisualise les changements sans rien appliquer.
+
+  sudo ./harden.sh --non-interactive --user deploy --ssh-port 2222 --pubkey "\$(cat ~/.ssh/id_ed25519.pub)"
+      Exécution entièrement automatisée, utilisable en CI ou dans un script d'infra.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user) ARG_USER="${2:-}"; shift 2 ;;
+        --ssh-port) ARG_SSH_PORT="${2:-}"; shift 2 ;;
+        --allowed-ips) ARG_ALLOWED_IPS="${2:-}"; shift 2 ;;
+        --pubkey) ARG_PUBKEY="${2:-}"; shift 2 ;;
+        --disable-ipv6) ARG_DISABLE_IPV6="${2:-}"; shift 2 ;;
+        --limit-icmp) ARG_LIMIT_ICMP="${2:-}"; shift 2 ;;
+        --sudo-nopasswd) ARG_SUDO_NOPASSWD="${2:-}"; shift 2 ;;
+        --non-interactive) NON_INTERACTIVE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) show_error "Option inconnue : $1"; usage; exit 1 ;;
+    esac
+done
 
 # === Fonctions de validation ===
 
@@ -327,6 +407,15 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# Journalisation complète de la sortie dans un fichier, en plus de l'affichage à l'écran
+# (best-effort : si /var/log n'est pas inscriptible, on continue sans logguer dans un fichier).
+if touch "$LOG_FILE" 2>/dev/null; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    show_info "Journal complet de cette exécution : $LOG_FILE"
+else
+    show_warn "Impossible d'écrire dans $LOG_FILE : pas de journalisation fichier pour cette exécution."
+fi
+
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     DISTRO="$ID"
@@ -368,8 +457,12 @@ else
 fi
 
 if ! command -v sudo &>/dev/null; then
-    show_warn "sudo n'est pas installé, installation en cours..."
-    INSTALL_CMD sudo
+    if $DRY_RUN; then
+        dry_log "aurait installé le paquet 'sudo' (absent)."
+    else
+        show_warn "sudo n'est pas installé, installation en cours..."
+        INSTALL_CMD sudo
+    fi
 fi
 
 if command -v systemctl &>/dev/null; then
@@ -396,7 +489,9 @@ else
 fi
 
 # === Collecte des informations ===
-clear
+if [[ -t 1 ]]; then
+    clear
+fi
 echo -e "${GREEN}"
 cat <<'BANNER'
  __     __             ___    _  _              _              _
@@ -413,253 +508,315 @@ show_info "  vps-hardening-toolkit v${VERSION}, par x0u7s1d3r"
 show_info "  https://github.com/x0u7s1d3r/vps-hardening-toolkit"
 echo
 echo -e "${GREEN}🌟 Configuration du serveur 🌟${NC}"
+if $DRY_RUN; then
+    show_warn "MODE DRY-RUN : aucune modification ne sera appliquée au système."
+fi
+if $NON_INTERACTIVE; then
+    show_info "Mode non-interactif : valeurs fournies en argument (ou défauts) utilisées sans confirmation."
+fi
 
-NEW_USER=$(prompt_user "Quel nom souhaitez-vous pour l'utilisateur sécurisé SSH ?" "secureuser" "validate_username")
+NEW_USER=$(resolve_value "$ARG_USER" "Quel nom souhaitez-vous pour l'utilisateur sécurisé SSH ?" "secureuser" "validate_username")
 RANDOM_SSH_PORT=$(generate_random_port)
-SSH_PORT=$(prompt_user "Quel port souhaitez-vous pour SSH ?" "$RANDOM_SSH_PORT" "validate_port")
-show_secondary "(Laissez vide pour autoriser SSH depuis n'importe quelle IP - déconseillé)"
-ALLOWED_SSH_IPS=$(prompt_user "Entrez les IPs ou CIDR autorisés pour SSH (séparées par des espaces)" "" "validate_ips_list")
-DISABLE_IPV6=$(prompt_user "Voulez-vous désactiver IPv6 ?" "oui" "validate_yes_no")
-LIMIT_ICMP=$(prompt_user "Voulez-vous limiter les réponses ICMP (Ping) ?" "oui" "validate_yes_no")
-SUDO_NOPASSWD=$(prompt_user "Autoriser $NEW_USER à utiliser sudo SANS mot de passe ? (déconseillé)" "non" "validate_yes_no")
+SSH_PORT=$(resolve_value "$ARG_SSH_PORT" "Quel port souhaitez-vous pour SSH ?" "$RANDOM_SSH_PORT" "validate_port")
+if ! $NON_INTERACTIVE; then
+    show_secondary "(Laissez vide pour autoriser SSH depuis n'importe quelle IP - déconseillé)"
+fi
+ALLOWED_SSH_IPS=$(resolve_value "$ARG_ALLOWED_IPS" "Entrez les IPs ou CIDR autorisés pour SSH (séparées par des espaces)" "" "validate_ips_list")
+DISABLE_IPV6=$(resolve_value "$ARG_DISABLE_IPV6" "Voulez-vous désactiver IPv6 ?" "oui" "validate_yes_no")
+LIMIT_ICMP=$(resolve_value "$ARG_LIMIT_ICMP" "Voulez-vous limiter les réponses ICMP (Ping) ?" "oui" "validate_yes_no")
+SUDO_NOPASSWD=$(resolve_value "$ARG_SUDO_NOPASSWD" "Autoriser $NEW_USER à utiliser sudo SANS mot de passe ? (déconseillé)" "non" "validate_yes_no")
 
-show_secondary "Avez-vous déjà une paire de clés SSH et voulez-vous fournir votre clé PUBLIQUE (recommandé, plus sûr que de générer la clé sur le serveur) ?"
-HAS_OWN_KEY=$(prompt_user "Fournir ma propre clé publique ?" "oui" "validate_yes_no")
-if is_yes "$HAS_OWN_KEY"; then
-    USER_PUBKEY=$(prompt_user "Collez votre clé publique (ssh-ed25519 AAAA...)" "" "validate_pubkey")
-else
+if [[ -n "$ARG_PUBKEY" ]]; then
+    validate_pubkey "$ARG_PUBKEY" || exit 1
+    USER_PUBKEY="$ARG_PUBKEY"
+elif $NON_INTERACTIVE; then
     USER_PUBKEY=""
-    show_warn "Une paire de clés sera générée sur le serveur. La clé privée ne sera PAS affichée à l'écran par défaut : le script vous donnera la commande scp pour la récupérer."
+    show_warn "Mode non-interactif sans --pubkey : une paire de clés sera générée sur le serveur."
+else
+    show_secondary "Avez-vous déjà une paire de clés SSH et voulez-vous fournir votre clé PUBLIQUE (recommandé, plus sûr que de générer la clé sur le serveur) ?"
+    HAS_OWN_KEY=$(prompt_user "Fournir ma propre clé publique ?" "oui" "validate_yes_no")
+    if is_yes "$HAS_OWN_KEY"; then
+        USER_PUBKEY=$(prompt_user "Collez votre clé publique (ssh-ed25519 AAAA...)" "" "validate_pubkey")
+    else
+        USER_PUBKEY=""
+        show_warn "Une paire de clés sera générée sur le serveur. La clé privée ne sera PAS affichée à l'écran par défaut : le script vous donnera la commande scp pour la récupérer."
+    fi
 fi
 
 show_success "🔒 Début de la sécurisation du serveur VPS..."
+if $DRY_RUN; then
+    show_warn "(dry-run : les étapes ci-dessous décrivent ce qui SERAIT fait, rien n'est modifié)"
+fi
 
 # === 1. Création du nouvel utilisateur ===
-show_info "👤 Création de l'utilisateur SSH : $NEW_USER"
-if ! id "$NEW_USER" &>/dev/null; then
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        adduser --disabled-password --gecos "" "$NEW_USER"
+show_info "👤 Utilisateur SSH : $NEW_USER"
+if $DRY_RUN; then
+    dry_log "aurait créé l'utilisateur '$NEW_USER' (groupe $SUDO_GROUP) si absent, mot de passe désactivé."
+    dry_log "aurait ajouté /etc/sudoers.d/$NEW_USER, sudo $(is_yes "$SUDO_NOPASSWD" && echo 'SANS' || echo 'AVEC') mot de passe."
+else
+    if ! id "$NEW_USER" &>/dev/null; then
+        if [[ "$PKG_MANAGER" == "apt" ]]; then
+            adduser --disabled-password --gecos "" "$NEW_USER"
+        else
+            useradd -m -s /bin/bash "$NEW_USER"
+            passwd -l "$NEW_USER" &>/dev/null   # verrouille le mot de passe (équivalent de --disabled-password)
+        fi
+        show_success "✅ Utilisateur $NEW_USER créé."
     else
-        useradd -m -s /bin/bash "$NEW_USER"
-        passwd -l "$NEW_USER" &>/dev/null   # verrouille le mot de passe (équivalent de --disabled-password)
+        show_warn "L'utilisateur $NEW_USER existe déjà."
     fi
-    show_success "✅ Utilisateur $NEW_USER créé."
-else
-    show_warn "L'utilisateur $NEW_USER existe déjà."
-fi
 
-# Ajouter au groupe sudo/wheel selon la distribution
-usermod -aG "$SUDO_GROUP" "$NEW_USER"
+    # Ajouter au groupe sudo/wheel selon la distribution
+    usermod -aG "$SUDO_GROUP" "$NEW_USER"
 
-register_action "sudoers"
-if is_yes "$SUDO_NOPASSWD"; then
-    echo "$NEW_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$NEW_USER"
-else
-    echo "$NEW_USER ALL=(ALL) ALL" > "/etc/sudoers.d/$NEW_USER"
+    register_action "sudoers"
+    if is_yes "$SUDO_NOPASSWD"; then
+        echo "$NEW_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$NEW_USER"
+    else
+        echo "$NEW_USER ALL=(ALL) ALL" > "/etc/sudoers.d/$NEW_USER"
+    fi
+    chmod 0440 "/etc/sudoers.d/$NEW_USER"
+    if ! visudo -cf "/etc/sudoers.d/$NEW_USER" &>/dev/null; then
+        show_error "Fichier sudoers généré invalide, suppression par sécurité."
+        rm -f "/etc/sudoers.d/$NEW_USER"
+        exit 1
+    fi
+    show_success "✅ Ajout de $NEW_USER aux sudoers ($(is_yes "$SUDO_NOPASSWD" && echo 'sans' || echo 'avec') mot de passe)."
 fi
-chmod 0440 "/etc/sudoers.d/$NEW_USER"
-if ! visudo -cf "/etc/sudoers.d/$NEW_USER" &>/dev/null; then
-    show_error "Fichier sudoers généré invalide, suppression par sécurité."
-    rm -f "/etc/sudoers.d/$NEW_USER"
-    exit 1
-fi
-show_success "✅ Ajout de $NEW_USER aux sudoers ($([[ $(is_yes "$SUDO_NOPASSWD"; echo $?) -eq 0 ]] && echo 'sans' || echo 'avec') mot de passe)."
 
 # === 2. Configuration des clés SSH ===
 show_info "🔑 Configuration des clés SSH..."
-
 SSH_DIR="/home/$NEW_USER/.ssh"
-mkdir -p "$SSH_DIR"
-chmod 700 "$SSH_DIR"
-touch "$SSH_DIR/authorized_keys"
-chmod 600 "$SSH_DIR/authorized_keys"
 
-if [[ -n "$USER_PUBKEY" ]]; then
-    if ! grep -qF "$USER_PUBKEY" "$SSH_DIR/authorized_keys" 2>/dev/null; then
-        echo "$USER_PUBKEY" >> "$SSH_DIR/authorized_keys"
+if $DRY_RUN; then
+    if [[ -n "$USER_PUBKEY" ]]; then
+        dry_log "aurait installé votre clé publique fournie dans $SSH_DIR/authorized_keys."
+    else
+        dry_log "aurait généré une nouvelle paire de clés ed25519 dans $SSH_DIR/ et installé la clé publique dans authorized_keys."
     fi
-    show_success "✅ Votre clé publique a été installée pour $NEW_USER."
 else
-    if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
-        ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519" -N "" -C "$NEW_USER@$(hostname)-$TIMESTAMP" &>/dev/null
-        show_success "✅ Clé SSH ED25519 générée sur le serveur."
-    fi
-    if ! grep -qF "$(cat "$SSH_DIR/id_ed25519.pub")" "$SSH_DIR/authorized_keys" 2>/dev/null; then
-        cat "$SSH_DIR/id_ed25519.pub" >> "$SSH_DIR/authorized_keys"
-    fi
-fi
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    touch "$SSH_DIR/authorized_keys"
+    chmod 600 "$SSH_DIR/authorized_keys"
 
-chown -R "$NEW_USER:$NEW_USER" "$SSH_DIR"
-show_success "✅ authorized_keys configuré pour $NEW_USER."
+    if [[ -n "$USER_PUBKEY" ]]; then
+        if ! grep -qF "$USER_PUBKEY" "$SSH_DIR/authorized_keys" 2>/dev/null; then
+            echo "$USER_PUBKEY" >> "$SSH_DIR/authorized_keys"
+        fi
+        show_success "✅ Votre clé publique a été installée pour $NEW_USER."
+    else
+        if [[ ! -f "$SSH_DIR/id_ed25519" ]]; then
+            ssh-keygen -t ed25519 -f "$SSH_DIR/id_ed25519" -N "" -C "$NEW_USER@$(hostname)-$TIMESTAMP" &>/dev/null
+            show_success "✅ Clé SSH ED25519 générée sur le serveur."
+        fi
+        if ! grep -qF "$(cat "$SSH_DIR/id_ed25519.pub")" "$SSH_DIR/authorized_keys" 2>/dev/null; then
+            cat "$SSH_DIR/id_ed25519.pub" >> "$SSH_DIR/authorized_keys"
+        fi
+    fi
+
+    chown -R "$NEW_USER:$NEW_USER" "$SSH_DIR"
+    show_success "✅ authorized_keys configuré pour $NEW_USER."
+fi
 
 # === 3. Sécurisation du service SSH ===
 show_info "🔧 Sécurisation du service SSH..."
-register_action "ssh"
 
-# On sauvegarde et corrige le fichier principal...
-cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak_${TIMESTAMP}"
-SSHD_TOUCHED_FILES+=("$SSHD_CONFIG")
-
-# ...ET tout drop-in dans sshd_config.d (ex: 50-cloud-init.conf sur les images Ubuntu cloud
-# force souvent "PasswordAuthentication yes" et écraserait silencieusement notre changement,
-# car ces fichiers sont inclus AVANT la suite du fichier principal).
+# Détection des fichiers concernés (lecture seule, effectuée même en dry-run) : le fichier
+# principal, PLUS tout drop-in dans sshd_config.d (ex: 50-cloud-init.conf sur les images
+# Ubuntu cloud force souvent "PasswordAuthentication yes" et écraserait silencieusement notre
+# changement, car ces fichiers sont inclus AVANT la suite du fichier principal).
+SSHD_TOUCHED_FILES=("$SSHD_CONFIG")
 if [[ -d "$SSHD_CONFIG_D" ]]; then
     while IFS= read -r -d '' dropin; do
         if grep -qE '^[[:space:]]*(PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|Port|ChallengeResponseAuthentication|KbdInteractiveAuthentication)\b' "$dropin"; then
-            cp "$dropin" "${dropin}.bak_${TIMESTAMP}"
             SSHD_TOUCHED_FILES+=("$dropin")
         fi
     done < <(find "$SSHD_CONFIG_D" -maxdepth 1 -name '*.conf' -print0 2>/dev/null)
 fi
 
-for f in "${SSHD_TOUCHED_FILES[@]}"; do
-    set_sshd_option "Port" "$SSH_PORT" "$f"
-    set_sshd_option "PermitRootLogin" "no" "$f"
-    set_sshd_option "PasswordAuthentication" "no" "$f"
-    set_sshd_option "PubkeyAuthentication" "yes" "$f"
-    # ChallengeResponseAuthentication est l'ancien nom ; KbdInteractiveAuthentication (>= OpenSSH 8.7)
-    # n'est ajusté que s'il est déjà présent dans ce fichier, pour ne pas casser un sshd trop ancien
-    # qui ne connaît pas cette directive.
-    set_sshd_option "ChallengeResponseAuthentication" "no" "$f"
-    if grep -qE '^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication\b' "$f"; then
-        set_sshd_option "KbdInteractiveAuthentication" "no" "$f"
+if $DRY_RUN; then
+    dry_log "aurait appliqué Port $SSH_PORT, PermitRootLogin no, PasswordAuthentication no, PubkeyAuthentication yes dans :"
+    for f in "${SSHD_TOUCHED_FILES[@]}"; do
+        dry_log "  - $f"
+    done
+    dry_log "aurait validé avec 'sshd -t' puis redémarré $SSH_SERVICE."
+else
+    register_action "ssh"
+    for f in "${SSHD_TOUCHED_FILES[@]}"; do
+        cp "$f" "${f}.bak_${TIMESTAMP}"
+    done
+
+    for f in "${SSHD_TOUCHED_FILES[@]}"; do
+        set_sshd_option "Port" "$SSH_PORT" "$f"
+        set_sshd_option "PermitRootLogin" "no" "$f"
+        set_sshd_option "PasswordAuthentication" "no" "$f"
+        set_sshd_option "PubkeyAuthentication" "yes" "$f"
+        # ChallengeResponseAuthentication est l'ancien nom ; KbdInteractiveAuthentication (>= OpenSSH 8.7)
+        # n'est ajusté que s'il est déjà présent dans ce fichier, pour ne pas casser un sshd trop ancien
+        # qui ne connaît pas cette directive.
+        set_sshd_option "ChallengeResponseAuthentication" "no" "$f"
+        if grep -qE '^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication\b' "$f"; then
+            set_sshd_option "KbdInteractiveAuthentication" "no" "$f"
+        fi
+    done
+    # NB: on laisse volontairement UsePAM à sa valeur par défaut (yes). Le désactiver casse
+    # des fonctionnalités PAM utiles (verrouillage de compte, future 2FA, quotas...) sans
+    # bénéfice de sécurité réel ici.
+
+    # Validation de la config AVANT de redémarrer, pour ne jamais restart un sshd cassé.
+    if ! sshd -t; then
+        show_error "La configuration SSH générée est invalide (sshd -t a échoué). Annulation avant redémarrage."
+        rollback
     fi
-done
-# NB: on laisse volontairement UsePAM à sa valeur par défaut (yes). Le désactiver casse
-# des fonctionnalités PAM utiles (verrouillage de compte, future 2FA, quotas...) sans
-# bénéfice de sécurité réel ici.
 
-# Validation de la config AVANT de redémarrer, pour ne jamais restart un sshd cassé.
-if ! sshd -t; then
-    show_error "La configuration SSH générée est invalide (sshd -t a échoué). Annulation avant redémarrage."
-    rollback
+    manage_service "$SSH_SERVICE" restart
+    show_success "✅ SSH sécurisé et redémarré."
 fi
-
-manage_service "$SSH_SERVICE" restart
-show_success "✅ SSH sécurisé et redémarré."
 
 # === 4. Désactivation de l'IPv6 si demandé ===
 if is_yes "$DISABLE_IPV6"; then
-    show_info "🌍 Désactivation de IPv6..."
-    register_action "ipv6"
-    cat > "$IPV6_DROPIN" <<EOF
+    show_info "🌍 IPv6"
+    if $DRY_RUN; then
+        dry_log "aurait désactivé IPv6 via $IPV6_DROPIN"
+    else
+        register_action "ipv6"
+        cat > "$IPV6_DROPIN" <<EOF
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
-    sysctl --system &>/dev/null
-    show_success "✅ IPv6 désactivé."
+        sysctl --system &>/dev/null
+        show_success "✅ IPv6 désactivé."
+    fi
 else
     show_warn "IPv6 reste activé."
 fi
 
 # === 5. Limitation du Ping (ICMP Echo Reply) si demandé ===
 if is_yes "$LIMIT_ICMP"; then
-    show_info "📡 Limitation des réponses aux pings..."
-    register_action "icmp"
-    cat > "$ICMP_DROPIN" <<EOF
+    show_info "📡 ICMP"
+    if $DRY_RUN; then
+        dry_log "aurait limité les réponses ICMP via $ICMP_DROPIN"
+    else
+        register_action "icmp"
+        cat > "$ICMP_DROPIN" <<EOF
 net.ipv4.icmp_echo_ignore_all = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ratelimit = 100
 net.ipv4.icmp_ratemask = 88089
 EOF
-    sysctl --system &>/dev/null
-    show_success "✅ ICMP Echo limité."
+        sysctl --system &>/dev/null
+        show_success "✅ ICMP Echo limité."
+    fi
 else
     show_warn "Réponses ICMP non limitées."
 fi
 
 # === 6. Configuration du firewall ===
-show_info "🌐 Configuration du firewall $FIREWALL_SERVICE..."
-register_action "firewall"
+show_info "🌐 Firewall ($FIREWALL_SERVICE)"
 
-if [[ "$FIREWALL_SERVICE" == "ufw" ]]; then
-    if ! command -v ufw &>/dev/null; then
-        show_warn "📦 Installation de UFW..."
-        INSTALL_CMD ufw
-    fi
-
-    if ufw status 2>/dev/null | grep -q "Status: active"; then
-        show_warn "Un firewall UFW actif a été détecté. Ses règles vont être écrasées."
-        ufw status verbose > "/root/ufw_status_backup_${TIMESTAMP}.txt" 2>/dev/null || true
-        show_info "Un instantané des règles actuelles a été sauvegardé dans /root/ufw_status_backup_${TIMESTAMP}.txt (à titre de référence, restauration manuelle si besoin)."
-    fi
-
-    ufw --force reset &>/dev/null
-    ufw default deny incoming &>/dev/null
-    ufw default allow outgoing &>/dev/null
-    ufw allow in on lo &>/dev/null
-    ufw allow 80/tcp &>/dev/null
-    ufw allow 443/tcp &>/dev/null
-
+if $DRY_RUN; then
     if [[ -n "$ALLOWED_SSH_IPS" ]]; then
-        show_info "🔒 Restriction SSH : Seules les IPs/réseaux suivants sont autorisés : $ALLOWED_SSH_IPS"
-        for IP in $ALLOWED_SSH_IPS; do
-            ufw allow from "$IP" to any port "$SSH_PORT" proto tcp &>/dev/null
-        done
+        dry_log "aurait configuré $FIREWALL_SERVICE : tout bloqué en entrée par défaut, 80/443 ouverts, SSH sur $SSH_PORT restreint à : $ALLOWED_SSH_IPS, port 22 bloqué."
     else
-        show_warn "SSH ouvert à tous sur le port $SSH_PORT (aucune IP de restriction fournie)."
-        ufw allow "$SSH_PORT"/tcp &>/dev/null
+        dry_log "aurait configuré $FIREWALL_SERVICE : tout bloqué en entrée par défaut, 80/443 ouverts, SSH sur $SSH_PORT ouvert à toutes les IPs, port 22 bloqué."
+    fi
+else
+    register_action "firewall"
+
+    if [[ "$FIREWALL_SERVICE" == "ufw" ]]; then
+        if ! command -v ufw &>/dev/null; then
+            show_warn "📦 Installation de UFW..."
+            INSTALL_CMD ufw
+        fi
+
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            show_warn "Un firewall UFW actif a été détecté. Ses règles vont être écrasées."
+            ufw status verbose > "/root/ufw_status_backup_${TIMESTAMP}.txt" 2>/dev/null || true
+            show_info "Un instantané des règles actuelles a été sauvegardé dans /root/ufw_status_backup_${TIMESTAMP}.txt (à titre de référence, restauration manuelle si besoin)."
+        fi
+
+        ufw --force reset &>/dev/null
+        ufw default deny incoming &>/dev/null
+        ufw default allow outgoing &>/dev/null
+        ufw allow in on lo &>/dev/null
+        ufw allow 80/tcp &>/dev/null
+        ufw allow 443/tcp &>/dev/null
+
+        if [[ -n "$ALLOWED_SSH_IPS" ]]; then
+            show_info "🔒 Restriction SSH : Seules les IPs/réseaux suivants sont autorisés : $ALLOWED_SSH_IPS"
+            for IP in $ALLOWED_SSH_IPS; do
+                ufw allow from "$IP" to any port "$SSH_PORT" proto tcp &>/dev/null
+            done
+        else
+            show_warn "SSH ouvert à tous sur le port $SSH_PORT (aucune IP de restriction fournie)."
+            ufw allow "$SSH_PORT"/tcp &>/dev/null
+        fi
+
+        ufw deny 22/tcp &>/dev/null
+        ufw --force enable &>/dev/null
+
+    elif [[ "$FIREWALL_SERVICE" == "firewalld" ]]; then
+        if ! command -v firewall-cmd &>/dev/null; then
+            show_warn "📦 Installation de firewalld..."
+            INSTALL_CMD firewalld
+        fi
+        manage_service firewalld enable
+        manage_service firewalld start
+
+        firewall-cmd --set-default-zone=drop &>/dev/null
+        firewall-cmd --permanent --zone=trusted --add-interface=lo &>/dev/null
+
+        firewall-cmd --permanent --zone=public --add-service=http &>/dev/null
+        firewall-cmd --permanent --zone=public --add-service=https &>/dev/null
+
+        if [[ -n "$ALLOWED_SSH_IPS" ]]; then
+            show_info "🔒 Restriction SSH : Seules les IPs/réseaux suivants sont autorisés : $ALLOWED_SSH_IPS"
+            for IP in $ALLOWED_SSH_IPS; do
+                firewall-cmd --permanent --zone=trusted --add-rich-rule="rule family='ipv4' source address='$IP' port protocol='tcp' port='$SSH_PORT' accept" &>/dev/null
+            done
+        else
+            show_warn "SSH ouvert à tous sur le port $SSH_PORT (aucune IP de restriction fournie)."
+            firewall-cmd --permanent --zone=public --add-port="$SSH_PORT"/tcp &>/dev/null
+        fi
+
+        firewall-cmd --permanent --zone=public --remove-service=ssh &>/dev/null || true
+        firewall-cmd --permanent --zone=public --remove-port=22/tcp &>/dev/null || true
+
+        firewall-cmd --reload &>/dev/null
     fi
 
-    ufw deny 22/tcp &>/dev/null
-    ufw --force enable &>/dev/null
-
-elif [[ "$FIREWALL_SERVICE" == "firewalld" ]]; then
-    if ! command -v firewall-cmd &>/dev/null; then
-        show_warn "📦 Installation de firewalld..."
-        INSTALL_CMD firewalld
-    fi
-    manage_service firewalld enable
-    manage_service firewalld start
-
-    firewall-cmd --set-default-zone=drop &>/dev/null
-    firewall-cmd --permanent --zone=trusted --add-interface=lo &>/dev/null
-
-    firewall-cmd --permanent --zone=public --add-service=http &>/dev/null
-    firewall-cmd --permanent --zone=public --add-service=https &>/dev/null
-
-    if [[ -n "$ALLOWED_SSH_IPS" ]]; then
-        show_info "🔒 Restriction SSH : Seules les IPs/réseaux suivants sont autorisés : $ALLOWED_SSH_IPS"
-        for IP in $ALLOWED_SSH_IPS; do
-            firewall-cmd --permanent --zone=trusted --add-rich-rule="rule family='ipv4' source address='$IP' port protocol='tcp' port='$SSH_PORT' accept" &>/dev/null
-        done
-    else
-        show_warn "SSH ouvert à tous sur le port $SSH_PORT (aucune IP de restriction fournie)."
-        firewall-cmd --permanent --zone=public --add-port="$SSH_PORT"/tcp &>/dev/null
-    fi
-
-    firewall-cmd --permanent --zone=public --remove-service=ssh &>/dev/null || true
-    firewall-cmd --permanent --zone=public --remove-port=22/tcp &>/dev/null || true
-
-    firewall-cmd --reload &>/dev/null
+    show_success "✅ Firewall activé avec règles sécurisées."
 fi
-
-show_success "✅ Firewall activé avec règles sécurisées."
 
 # === 7. Installation et configuration de Fail2Ban ===
-show_info "🛡️ Installation et configuration de Fail2Ban..."
-register_action "fail2ban"
+show_info "🛡️ Fail2Ban"
 
-if ! command -v fail2ban-client &>/dev/null; then
-    INSTALL_CMD fail2ban
-fi
-
-# Le chemin de log SSH diffère selon la distribution ; si aucun des deux fichiers connus
-# n'existe (cas fréquent sur les images cloud minimalistes journald-only), on utilise le
-# backend systemd de fail2ban plutôt qu'un logpath qui ferait tourner fail2ban sans jamais
-# bannir personne.
-F2B_BACKEND_LINE=""
-if [[ -f /var/log/auth.log ]]; then
-    F2B_LOGPATH_LINE="logpath = /var/log/auth.log"
-elif [[ -f /var/log/secure ]]; then
-    F2B_LOGPATH_LINE="logpath = /var/log/secure"
+if $DRY_RUN; then
+    dry_log "aurait installé/configuré fail2ban pour surveiller SSH sur le port $SSH_PORT (ban 1h après 5 échecs en 10 min)."
 else
-    F2B_LOGPATH_LINE=""
-    F2B_BACKEND_LINE="backend = systemd"
-fi
+    register_action "fail2ban"
 
-cat <<EOF > /etc/fail2ban/jail.local
+    if ! command -v fail2ban-client &>/dev/null; then
+        INSTALL_CMD fail2ban
+    fi
+
+    # Le chemin de log SSH diffère selon la distribution ; si aucun des deux fichiers connus
+    # n'existe (cas fréquent sur les images cloud minimalistes journald-only), on utilise le
+    # backend systemd de fail2ban plutôt qu'un logpath qui ferait tourner fail2ban sans jamais
+    # bannir personne.
+    F2B_BACKEND_LINE=""
+    if [[ -f /var/log/auth.log ]]; then
+        F2B_LOGPATH_LINE="logpath = /var/log/auth.log"
+    elif [[ -f /var/log/secure ]]; then
+        F2B_LOGPATH_LINE="logpath = /var/log/secure"
+    else
+        F2B_LOGPATH_LINE=""
+        F2B_BACKEND_LINE="backend = systemd"
+    fi
+
+    cat <<EOF > /etc/fail2ban/jail.local
 [sshd]
 enabled = true
 port = $SSH_PORT
@@ -671,10 +828,20 @@ bantime = 1h
 findtime = 10m
 EOF
 
-manage_service fail2ban restart
-manage_service fail2ban enable
+    manage_service fail2ban restart
+    manage_service fail2ban enable
 
-show_success "✅ Fail2Ban configuré pour SSH."
+    show_success "✅ Fail2Ban configuré pour SSH."
+fi
+
+# === Fin de la simulation en mode dry-run : rien n'a été modifié, pas de vérification à faire ===
+if $DRY_RUN; then
+    echo
+    show_info "----------------------------------------"
+    show_success "🔎 Dry-run terminé : aucun changement n'a été appliqué au système."
+    show_info "Relancez sans --dry-run (avec --non-interactive si besoin) pour appliquer ces changements pour de vrai."
+    exit 0
+fi
 
 # Vérifier si le service SSH écoute bien sur le bon port
 sleep 2
@@ -703,12 +870,16 @@ if [[ -z "$USER_PUBKEY" ]]; then
     show_warn "Récupérez-la IMMÉDIATEMENT depuis votre machine locale, puis supprimez-la du serveur :"
     show_secondary "  scp -P $SSH_PORT $NEW_USER@<VOTRE_IP>:$SSH_DIR/id_ed25519 ~/.ssh/vps_key"
     show_secondary "  ssh -p $SSH_PORT -i ~/.ssh/vps_key $NEW_USER@<VOTRE_IP> 'shred -u ~/.ssh/id_ed25519'"
-    show_warn "Ne partagez jamais cette clé. Si vous préférez l'afficher directement ici (déconseillé, reste dans le scrollback/logs du terminal) :"
-    SHOW_KEY=$(prompt_user "Afficher la clé privée à l'écran maintenant ?" "non" "validate_yes_no")
-    if is_yes "$SHOW_KEY"; then
-        show_info "----------------------------------------"
-        cat "$SSH_DIR/id_ed25519"
-        show_info "----------------------------------------"
+    if $NON_INTERACTIVE; then
+        show_info "Mode non-interactif : la clé privée n'est pas affichée automatiquement (récupérez-la via scp ci-dessus)."
+    else
+        show_warn "Ne partagez jamais cette clé. Si vous préférez l'afficher directement ici (déconseillé, reste dans le scrollback/logs du terminal) :"
+        SHOW_KEY=$(prompt_user "Afficher la clé privée à l'écran maintenant ?" "non" "validate_yes_no")
+        if is_yes "$SHOW_KEY"; then
+            show_info "----------------------------------------"
+            cat "$SSH_DIR/id_ed25519"
+            show_info "----------------------------------------"
+        fi
     fi
 fi
 
@@ -718,55 +889,21 @@ show_secondary "➡ ssh -p $SSH_PORT $NEW_USER@<VOTRE_IP>"
 show_info "Si la connexion fonctionne, vous pouvez fermer cette session."
 
 # === Vérification finale ===
-show_info "\n----------------------------------------"
-CONFIRM=$(prompt_user "Tout fonctionne bien depuis une autre connexion ? (oui/non)" "non" "validate_yes_no")
-
-if ! is_yes "$CONFIRM"; then
-    trap 'rollback' ERR
-    rollback
+if $NON_INTERACTIVE; then
+    show_success "✅ Mode non-interactif : sécurisation appliquée et vérifiée automatiquement (SSH répond sur le port $SSH_PORT)."
 else
-    show_success "✅ Sécurisation validée !"
+    show_info "\n----------------------------------------"
+    CONFIRM=$(prompt_user "Tout fonctionne bien depuis une autre connexion ? (oui/non)" "non" "validate_yes_no")
+
+    if ! is_yes "$CONFIRM"; then
+        trap 'rollback' ERR
+        rollback
+    else
+        show_success "✅ Sécurisation validée !"
+    fi
 fi
 
 # ==============================================================================
-# Résumé des correctifs apportés par rapport au script original :
-#
-# Fiabilité / anti-lockout :
-#   - Validation "sshd -t" avant tout redémarrage de sshd (évite de restart une config cassée).
-#   - set_sshd_option() remplace les sed fragiles qui ne matchaient que les lignes commentées :
-#     applique désormais la valeur que la ligne soit commentée, déjà définie, ou absente.
-#   - Détection et correction des drop-ins /etc/ssh/sshd_config.d/*.conf (ex: 50-cloud-init.conf
-#     sur Ubuntu cloud, qui force PasswordAuthentication yes après le fichier principal).
-#   - register_action() appelé AVANT chaque action risquée (et non après), pour que le rollback
-#     fonctionne même si l'action échoue en cours de route.
-#   - rollback() parcourt les actions dans l'ordre INVERSE (on rouvre le firewall avant de remettre
-#     l'ancien port SSH), pour éviter une fenêtre de blocage pendant l'annulation.
-#   - trap ERR désarmé au début de rollback() pour éviter une boucle de rollback récursif.
-#   - manage_service() propage désormais le vrai code de retour (avant : toujours "succès").
-#
-# Portabilité multi-distro :
-#   - Création d'utilisateur adaptée (adduser Debian-only vs useradd+passwd -l ailleurs).
-#   - Groupe sudo/wheel détecté selon la distribution (usermod -aG sudo cassait sur RHEL-like).
-#   - Regex de distribution corrigée pour matcher "almalinux" (et pas seulement "alma").
-#   - fail2ban : logpath adapté (auth.log vs secure) ou passage en backend systemd si aucun
-#     fichier de log classique n'existe (image cloud minimaliste).
-#   - Vérification/installation de "sudo" s'il est absent.
-#
-# Sécurité :
-#   - Plus d'affichage systématique de la clé privée en clair : option de fournir sa propre
-#     clé publique (recommandé), sinon affichage seulement sur confirmation explicite, avec
-#     commande scp fournie pour récupérer la clé proprement.
-#   - sudo NOPASSWD n'est plus la valeur imposée par défaut ; demandé explicitement, avec
-#     validation du fichier sudoers via "visudo -cf" et permissions 0440.
-#   - UsePAM n'est plus désactivé (cassait 2FA/PAM sans bénéfice de sécurité réel).
-#   - IPv6/ICMP gérés via des fichiers de dépôt /etc/sysctl.d/ dédiés (idempotents, rollback =
-#     suppression du fichier) plutôt que des "echo >>" cumulatifs dans sysctl.conf.
-#   - Sauvegarde des règles UFW existantes avant "reset" si un firewall était déjà actif.
-#   - Pas de doublons dans authorized_keys en cas de ré-exécution du script.
-#
-# Validation :
-#   - validate_port/is_port_in_use corrigés (ancrage regex ":$port" -> évite les faux positifs
-#     du type port 22 matchant aussi 2222).
-#   - validate_yes_no unifié et insensible à la casse (oui/non/o/y/yes/no acceptés partout).
-#   - validate_ip vérifie désormais que chaque octet est bien entre 0 et 255.
+# Historique détaillé des versions : voir CHANGELOG.md
+# Guide d'utilisation complet (durcissement + hébergement d'un site) : docs/TUTORIEL.md
 # ==============================================================================

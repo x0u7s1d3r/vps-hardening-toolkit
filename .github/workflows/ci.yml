@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Vérification syntaxique (bash -n)
+        run: bash -n harden.sh
+
+      - name: shellcheck
+        run: shellcheck --severity=warning harden.sh
+
+  integration-test:
+    name: Test d'intégration (exécution réelle sur un runner jetable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Préparer un environnement type "VPS tout neuf" (sshd présent et actif)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable --now ssh
+
+      - name: Générer une clé SSH jetable pour le test
+        run: ssh-keygen -t ed25519 -f /tmp/testkey -N "" -C "ci-test"
+
+      - name: Rendre le script exécutable
+        run: chmod +x harden.sh
+
+      - name: Vérifier que --dry-run ne modifie rien
+        run: |
+          sudo cp /etc/ssh/sshd_config /tmp/sshd_config.before
+          sudo ./harden.sh --non-interactive --dry-run \
+            --user citest --ssh-port 2222 --pubkey "$(cat /tmp/testkey.pub)"
+          sudo diff /etc/ssh/sshd_config /tmp/sshd_config.before
+
+      - name: Exécuter harden.sh pour de vrai (mode non-interactif)
+        run: |
+          sudo ./harden.sh --non-interactive \
+            --user citest \
+            --ssh-port 2222 \
+            --pubkey "$(cat /tmp/testkey.pub)" \
+            --allowed-ips "" \
+            --disable-ipv6 oui \
+            --limit-icmp oui \
+            --sudo-nopasswd non
+
+      - name: Vérifier la configuration SSH (clé uniquement, root désactivé)
+        run: |
+          sudo sshd -t
+          sudo sshd -T | grep -iE "^permitrootlogin no$"
+          sudo sshd -T | grep -iE "^passwordauthentication no$"
+          sudo sshd -T | grep -iE "^port 2222$"
+
+      - name: Vérifier qu'une vraie connexion SSH par clé fonctionne sur le nouveau port
+        run: |
+          ssh -p 2222 -i /tmp/testkey \
+            -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 \
+            citest@127.0.0.1 'whoami' | grep -qx citest
+
+      - name: Vérifier le firewall (ufw actif, port 2222 autorisé)
+        run: |
+          sudo ufw status verbose | grep -q "Status: active"
+          sudo ufw status | grep -q "2222"
+
+      - name: Vérifier fail2ban (actif, jail sshd configurée)
+        run: |
+          sudo systemctl is-active fail2ban
+          sudo fail2ban-client status sshd
+
+      - name: Vérifier le journal de sortie du script
+        run: sudo test -s /var/log/vps-hardening-toolkit.log
