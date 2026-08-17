@@ -2,6 +2,29 @@
 
 Toutes les évolutions notables de ce projet sont documentées ici. Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [1.3.0] - 2026-08-17
+
+### Corrigé (sécurité / RHEL-family)
+
+- **SELinux** : sur RHEL/CentOS/Rocky/AlmaLinux/Fedora avec SELinux en mode `Enforcing` (le défaut sur ces distributions), sshd est confiné au domaine `sshd_t` et ne peut se binder QUE sur les ports étiquetés `ssh_port_t`. Le script changeait le port SSH sans jamais étiqueter le nouveau port, ce qui empêchait sshd de démarrer dessus sur un vrai VPS RHEL-like (`Bind to port ... failed: Permission denied`) — allant à l'encontre du but même du script. Nouvelle fonction `configure_selinux_ssh_port()` : détecte SELinux (`getenforce`), installe `policycoreutils-python-utils` si `semanage` est absent, étiquette le nouveau port (`semanage port -a/-m -t ssh_port_t`) en évitant d'écraser un port déjà réservé par un autre service, et défait l'étiquetage au rollback. No-op silencieux sur les distributions sans SELinux (Debian/Ubuntu, Arch) ou avec SELinux désactivé.
+
+### Corrigé (idempotence)
+
+- Relancer `harden.sh` une seconde fois avec le même `--ssh-port` sur un serveur déjà durci échouait systématiquement : `validate_port()` rejetait ce port comme "déjà utilisé", alors qu'il l'était... par le sshd que le script lui-même avait configuré au tour précédent. Le port SSH actuellement configuré (`sshd -T`) est maintenant lu avant validation et exempté de ce contrôle.
+
+### Corrigé (affichage)
+
+- La bannière et `--help` affichaient parfois un numéro de version incohérent (ex: "v24.04.4 LTS (Noble Numbat)" au lieu de "v1.3.0") : le script utilisait une variable `VERSION`, or `/etc/os-release` définit LUI-MÊME une variable `VERSION` (le nom de version de la distribution), et le `. /etc/os-release` fait plus loin pour détecter la distribution écrasait silencieusement la nôtre. Renommée en `TOOLKIT_VERSION`. Bug repéré via un test manuel du script pendant cette session, pas par la CI (couvre un cas que shellcheck ne peut pas détecter : une collision de nom avec une variable définie dans un fichier externe sourcé).
+
+### Ajouté
+
+- Job CI `integration-test` étendu : simule désormais un vrai drop-in `50-cloud-init.conf` avant l'exécution (jamais testé en conditions réelles jusqu'ici, seulement relu) et vérifie qu'il est bien corrigé ; ajoute une seconde exécution du script avec les mêmes paramètres pour vérifier l'idempotence (pas de doublon dans `authorized_keys`, SSH toujours fonctionnel après).
+
+### Recherché, considéré, et volontairement non modifié
+
+- **fail2ban + firewalld sur RHEL-family** : la configuration par défaut du paquet fail2ban gère déjà correctement la coexistence avec firewalld sur les distributions supportées ; forcer un `banaction` spécifique (ex: nftables natif) dans `jail.local` risquerait de casser ce qui fonctionne déjà sur certaines distributions pour un bénéfice incertain. Non modifié après recherche.
+- **AppArmor sur Ubuntu/Debian** : contrairement à SELinux sur RHEL, `openssh-server` n'installe pas de profil AppArmor confinant sshd par défaut sur Ubuntu/Debian — pas de restriction de port équivalente à corriger.
+
 ## [1.2.0] - 2026-08-17
 
 ### Ajouté

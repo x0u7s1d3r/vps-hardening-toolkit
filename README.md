@@ -17,6 +17,8 @@ La plupart des scripts de "hardening VPS" qu'on trouve sur GitHub ou YouTube ont
 - Détection et correction des fichiers `/etc/ssh/sshd_config.d/*.conf` (notamment `50-cloud-init.conf` sur les images cloud Ubuntu, qui réactive silencieusement l'authentification par mot de passe après votre configuration).
 - Rollback automatique fiable en cas de problème (config sauvegardée, restaurée dans le bon ordre pour ne jamais rester bloqué dehors).
 - Compatible plusieurs distributions sans supposer que `adduser`/`usermod -aG sudo` se comportent pareil partout.
+- Étiquetage automatique du port SSH personnalisé sous SELinux (`semanage port`) sur RHEL/CentOS/Rocky/AlmaLinux/Fedora : sans ça, sshd refuse de démarrer sur un port non-standard dès que SELinux est en mode `Enforcing` (le réglage par défaut sur ces distributions) — un piège très fréquent, absent de la plupart des scripts équivalents.
+- Idempotent : relancer le script sur un serveur déjà durci (même port SSH, etc.) ne casse rien et ne duplique rien.
 
 ## Ce que fait le script
 
@@ -66,9 +68,9 @@ Chaque exécution est journalisée dans `/var/log/vps-hardening-toolkit.log`.
 Le pipeline CI (`.github/workflows/ci.yml`) tourne sur chaque push/PR et comprend 5 jobs indépendants :
 
 - **lint** : shellcheck + vérification syntaxique.
-- **integration-test** : exécution réelle et complète du script en mode non-interactif sur un runner Ubuntu jetable (connexion SSH par clé fonctionnelle, root et mot de passe désactivés, firewall actif, fail2ban actif).
+- **integration-test** : exécution réelle et complète du script en mode non-interactif sur un runner Ubuntu jetable, y compris : un faux drop-in `50-cloud-init.conf` créé avant l'exécution pour vérifier pour de vrai qu'il est corrigé (pas seulement `sshd_config`), et une seconde exécution du script avec les mêmes paramètres pour vérifier l'idempotence (pas de doublon dans `authorized_keys`, pas d'erreur).
 - **rollback-test** : simule un échec constaté par l'utilisateur (réponse "non" à la confirmation finale) et vérifie que `rollback()` restaure bien `sshd_config`, désactive le firewall, retire l'entrée sudoers, les drop-ins sysctl et la config fail2ban — le mécanisme anti-lockout le plus critique du script est donc lui-même testé, pas seulement relu.
-- **dry-run-rhel** / **dry-run-arch** : exécutent réellement (pas en théorie) la détection de distribution, la sélection dnf/pacman et firewalld/ufw, et surtout la détection du service SSH sur Rocky Linux et Arch Linux, en mode `--dry-run`. Ces deux jobs tournent dans un conteneur Docker simple (pas de vrai `systemd` en PID 1), donc ils ne couvrent pas le redémarrage réel des services comme le fait `integration-test` sur Ubuntu — c'est une limite assumée, pas cachée.
+- **dry-run-rhel** / **dry-run-arch** : exécutent réellement (pas en théorie) la détection de distribution, la sélection dnf/pacman et firewalld/ufw, et surtout la détection du service SSH sur Rocky Linux et Arch Linux, en mode `--dry-run`. Ces deux jobs tournent dans un conteneur Docker simple (pas de vrai `systemd` en PID 1, pas de SELinux enforcing non plus), donc ils ne couvrent pas le redémarrage réel des services ni l'étiquetage SELinux comme le ferait un vrai VPS RHEL — c'est une limite assumée, pas cachée. L'étiquetage SELinux (`configure_selinux_ssh_port` dans `harden.sh`) est donc revu par shellcheck et exercé en dry-run, mais pas vérifié en conditions réelles par la CI.
 
 ## Avertissements
 

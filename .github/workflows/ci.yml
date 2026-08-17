@@ -40,18 +40,29 @@ jobs:
           sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y openssh-server
           sudo systemctl enable --now ssh
 
+      - name: >
+          Simuler un drop-in cloud-init (50-cloud-init.conf) comme sur une vraie image
+          cloud Ubuntu, pour tester pour de vrai la fonctionnalité mise en avant par ce
+          script (jusqu'ici jamais exercée par la CI : un runner GitHub standard n'a pas
+          ce fichier par défaut)
+        run: |
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          echo "PasswordAuthentication yes" | sudo tee /etc/ssh/sshd_config.d/50-cloud-init.conf >/dev/null
+
       - name: Générer une clé SSH jetable pour le test
         run: ssh-keygen -t ed25519 -f /tmp/testkey -N "" -C "ci-test"
 
       - name: Rendre le script exécutable
         run: chmod +x harden.sh
 
-      - name: Vérifier que --dry-run ne modifie rien
+      - name: Vérifier que --dry-run ne modifie rien (config principale et drop-in cloud-init)
         run: |
           sudo cp /etc/ssh/sshd_config /tmp/sshd_config.before
+          sudo cp /etc/ssh/sshd_config.d/50-cloud-init.conf /tmp/50-cloud-init.conf.before
           sudo ./harden.sh --non-interactive --dry-run \
             --user citest --ssh-port 2222 --pubkey "$(cat /tmp/testkey.pub)"
           sudo diff /etc/ssh/sshd_config /tmp/sshd_config.before
+          sudo diff /etc/ssh/sshd_config.d/50-cloud-init.conf /tmp/50-cloud-init.conf.before
 
       - name: Exécuter harden.sh pour de vrai (mode non-interactif)
         run: |
@@ -71,6 +82,11 @@ jobs:
           sudo sshd -T | grep -iE "^passwordauthentication no$"
           sudo sshd -T | grep -iE "^port 2222$"
 
+      - name: >
+          Vérifier que le drop-in cloud-init lui-même a été corrigé (pas seulement
+          sshd_config principal) -- c'est la fonctionnalité que ce script met en avant
+        run: sudo grep -qiE "^PasswordAuthentication no" /etc/ssh/sshd_config.d/50-cloud-init.conf
+
       - name: Vérifier qu'une vraie connexion SSH par clé fonctionne sur le nouveau port
         run: |
           ssh -p 2222 -i /tmp/testkey \
@@ -89,6 +105,32 @@ jobs:
 
       - name: Vérifier le journal de sortie du script
         run: sudo test -s /var/log/vps-hardening-toolkit.log
+
+      - name: >
+          Relancer harden.sh une seconde fois avec les mêmes paramètres (idempotence :
+          un serveur déjà durci ne doit pas planter si on relance le script dessus)
+        run: |
+          sudo ./harden.sh --non-interactive \
+            --user citest \
+            --ssh-port 2222 \
+            --pubkey "$(cat /tmp/testkey.pub)" \
+            --allowed-ips "" \
+            --disable-ipv6 oui \
+            --limit-icmp oui \
+            --sudo-nopasswd non
+
+      - name: Vérifier que SSH répond toujours correctement après le second passage
+        run: |
+          sudo sshd -t
+          sudo sshd -T | grep -iE "^port 2222$"
+          ssh -p 2222 -i /tmp/testkey \
+            -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 \
+            citest@127.0.0.1 'whoami' | grep -qx citest
+
+      - name: Vérifier qu'il n'y a pas de doublon dans authorized_keys après le second passage
+        run: |
+          count=$(sudo grep -cF "$(cat /tmp/testkey.pub)" /home/citest/.ssh/authorized_keys)
+          test "$count" -eq 1
 
   rollback-test:
     name: Test du rollback (échec simulé -> restauration)

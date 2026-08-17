@@ -16,7 +16,12 @@
 #   Usage : sudo ./harden.sh [options]   (voir --help)
 # ============================================================================
 
-VERSION="1.2.0"
+# Nom volontairement distinct de "VERSION" : /etc/os-release définit LUI-MÊME une
+# variable VERSION (ex: "24.04.4 LTS (Noble Numbat)" sur Ubuntu), et ce script fait
+# ". /etc/os-release" plus loin pour lire $ID -- ce qui écraserait silencieusement notre
+# propre numéro de version si on utilisait le même nom (bug réel constaté : la bannière et
+# --help affichaient la version d'Ubuntu au lieu de celle du script).
+TOOLKIT_VERSION="1.3.0"
 
 set -e  # Arrête le script en cas d'erreur (voir gestion du trap ERR plus bas)
 set -u  # Erreur si variable non définie utilisée
@@ -125,7 +130,7 @@ resolve_value() {
 
 usage() {
     cat <<USAGE
-vps-hardening-toolkit v${VERSION} - harden.sh
+vps-hardening-toolkit v${TOOLKIT_VERSION} - harden.sh
 https://github.com/x0u7s1d3r/vps-hardening-toolkit
 
 Usage : sudo ./harden.sh [options]
@@ -238,7 +243,9 @@ is_port_in_use() {
 validate_port() {
     local port="$1"
     if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1024 && port <= 65535 )); then
-        if is_port_in_use "$port"; then
+        # Exception : si ce port est déjà le port SSH actuellement configuré (relance du
+        # script sur un serveur déjà durci, avec le même port), ce n'est pas un conflit.
+        if is_port_in_use "$port" && [[ "$port" != "${CURRENT_SSH_PORT:-}" ]]; then
             show_error "Le port $port est déjà utilisé."
             return 1
         fi
@@ -342,6 +349,49 @@ set_sshd_option() {
     fi
 }
 
+# Sur RHEL/CentOS/Rocky/AlmaLinux/Fedora, SELinux est actif (Enforcing) par défaut, et sshd
+# tourne confiné dans le domaine sshd_t, qui ne peut se binder QUE sur les ports étiquetés
+# ssh_port_t (22 par défaut). Changer le port dans sshd_config sans étiqueter le nouveau
+# port empêche sshd de démarrer dessus ("Bind to port ... failed: Permission denied"), ce
+# qui va à l'encontre même du but du script sur ces distributions. No-op silencieux si
+# SELinux est absent/désactivé (Debian/Ubuntu, Arch, ou RHEL avec SELinux désactivé).
+configure_selinux_ssh_port() {
+    if ! command -v getenforce &>/dev/null; then
+        return 0
+    fi
+    local se_status
+    se_status=$(getenforce 2>/dev/null || echo "Disabled")
+    if [[ "$se_status" == "Disabled" ]]; then
+        return 0
+    fi
+
+    if ! command -v semanage &>/dev/null; then
+        show_info "📦 Installation de policycoreutils-python-utils (nécessaire pour étiqueter le port SSH sous SELinux)..."
+        INSTALL_CMD policycoreutils-python-utils
+    fi
+    if ! command -v semanage &>/dev/null; then
+        show_warn "semanage indisponible même après installation : le port $SSH_PORT n'a pas pu être étiqueté pour SELinux. Si SELinux est en mode 'Enforcing', sshd risque de ne pas démarrer sur ce port (voir : semanage port -a -t ssh_port_t -p tcp $SSH_PORT)."
+        return 0
+    fi
+
+    if semanage port -l 2>/dev/null | grep -qE "^ssh_port_t[[:space:]]+tcp[[:space:]].*(,|[[:space:]])${SSH_PORT}(,|\$)"; then
+        show_info "Port $SSH_PORT déjà étiqueté ssh_port_t (SELinux) : rien à faire."
+        return 0
+    fi
+
+    if semanage port -l 2>/dev/null | grep -qE "tcp[[:space:]].*(,|[[:space:]])${SSH_PORT}(,|\$)"; then
+        show_warn "Le port $SSH_PORT est déjà étiqueté SELinux pour un AUTRE service : sshd risque de ne pas pouvoir y écouter. Choisissez un autre port SSH si possible."
+        return 0
+    fi
+
+    register_action "selinux_port"
+    if semanage port -a -t ssh_port_t -p tcp "$SSH_PORT" 2>/dev/null; then
+        show_success "✅ Port $SSH_PORT étiqueté ssh_port_t pour SELinux ($se_status)."
+    else
+        show_warn "Échec de l'étiquetage SELinux du port $SSH_PORT (semanage port -a). sshd risque de ne pas démarrer si SELinux est en mode 'Enforcing'."
+    fi
+}
+
 # Fonction de rollback
 rollback() {
     # On désarme le trap ERR pour éviter qu'une erreur PENDANT le rollback ne se relance
@@ -392,6 +442,10 @@ rollback() {
                 done
                 manage_service "$SSH_SERVICE" restart
                 show_success "✅ Configuration SSH restaurée."
+                ;;
+            "selinux_port")
+                command -v semanage &>/dev/null && semanage port -d -t ssh_port_t -p tcp "$SSH_PORT" &>/dev/null
+                show_success "✅ Étiquette SELinux du port SSH retirée."
                 ;;
             "sudoers")
                 rm -f "/etc/sudoers.d/$NEW_USER"
@@ -520,6 +574,13 @@ else
     exit 1
 fi
 
+# Port SSH actuellement configuré (si le script a déjà tourné une fois, ou si sshd est
+# déjà configuré par ailleurs). Sert uniquement à ne pas rejeter à tort, dans
+# validate_port(), le port qu'on s'apprête à reconfigurer : sans ça, relancer le script
+# une seconde fois avec le même --ssh-port échoue toujours, car ce port est déjà "in use"
+# par... le sshd que le script lui-même a configuré au tour précédent.
+CURRENT_SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+
 # === Collecte des informations ===
 if [[ -t 1 ]]; then
     clear
@@ -536,7 +597,7 @@ cat <<'BANNER'
         |_|                                                             |___/
 BANNER
 echo -e "${NC}"
-show_info "  vps-hardening-toolkit v${VERSION}, par x0u7s1d3r"
+show_info "  vps-hardening-toolkit v${TOOLKIT_VERSION}, par x0u7s1d3r"
 show_info "  https://github.com/x0u7s1d3r/vps-hardening-toolkit"
 echo
 echo -e "${GREEN}🌟 Configuration du serveur 🌟${NC}"
@@ -672,6 +733,7 @@ if $DRY_RUN; then
     for f in "${SSHD_TOUCHED_FILES[@]}"; do
         dry_log "  - $f"
     done
+    dry_log "aurait étiqueté le port $SSH_PORT pour SELinux si la distribution l'utilise (RHEL-like en mode Enforcing/Permissive)."
     dry_log "aurait validé avec 'sshd -t' puis redémarré $SSH_SERVICE."
 else
     register_action "ssh"
@@ -695,6 +757,11 @@ else
     # NB: on laisse volontairement UsePAM à sa valeur par défaut (yes). Le désactiver casse
     # des fonctionnalités PAM utiles (verrouillage de compte, future 2FA, quotas...) sans
     # bénéfice de sécurité réel ici.
+
+    # Étiquetage SELinux du port (no-op si SELinux absent/désactivé) : DOIT être fait avant
+    # le redémarrage de sshd ci-dessous, sinon sshd refuse de se binder sur le nouveau port
+    # tant que SELinux est en mode Enforcing (RHEL/CentOS/Rocky/AlmaLinux/Fedora).
+    configure_selinux_ssh_port
 
     # Validation de la config AVANT de redémarrer, pour ne jamais restart un sshd cassé.
     if ! sshd -t; then
