@@ -430,7 +430,12 @@ if [[ "$DISTRO" =~ ^(ubuntu|debian)$ ]]; then
     SUDO_GROUP="sudo"
 
     INSTALL_CMD() {
-        apt update -qq && apt install -y "$@" &>/dev/null
+        # DEBIAN_FRONTEND=noninteractive + NEEDRESTART_MODE=a : sur Ubuntu 22.04+/24.04, le
+        # paquet needrestart peut afficher une invite interactive ("quels services
+        # redémarrer ?") qui bloque indéfiniment un script non-interactif (CI, VPS distant
+        # sans TTY). Ces deux variables la neutralisent.
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt update -qq && \
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt install -y "$@" &>/dev/null
     }
 
 elif [[ "$DISTRO" =~ ^(centos|rhel|rocky|almalinux|fedora)$ ]]; then

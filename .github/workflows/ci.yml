@@ -30,7 +30,10 @@ jobs:
       - name: Préparer un environnement type "VPS tout neuf" (sshd présent et actif)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y openssh-server
+          # "sudo env VAR=val cmd" force les variables pour la commande, sans dépendre de la
+          # politique env_reset de sudo : sur Ubuntu 24.04, needrestart peut sinon afficher une
+          # invite interactive ("quels services redémarrer ?") qui bloque le job indéfiniment.
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y openssh-server
           sudo systemctl enable --now ssh
 
       - name: Générer une clé SSH jetable pour le test
