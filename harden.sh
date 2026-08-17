@@ -21,6 +21,10 @@ VERSION="1.1.0"
 set -e  # Arrête le script en cas d'erreur (voir gestion du trap ERR plus bas)
 set -u  # Erreur si variable non définie utilisée
 set -o pipefail
+set -o errtrace  # CRITIQUE : sans ça, le trap ERR (rollback) ne se déclenche PAS pour une
+                 # erreur survenant à l'intérieur d'une fonction (ex: manage_service) - le
+                 # script mourrait alors brutalement avec le code d'erreur brut, sans jamais
+                 # passer par le rollback censé éviter de rester bloqué dehors.
 
 # === Déclaration des variables ===
 ACTIONS_DONE=()  # Liste des actions effectuées, dans l'ORDRE d'exécution (le rollback les rejoue à l'envers)
@@ -847,8 +851,11 @@ bantime = 1h
 findtime = 10m
 EOF
 
-    manage_service fail2ban restart
-    manage_service fail2ban enable
+    # Non bloquant volontairement : fail2ban est une couche de protection supplémentaire,
+    # pas le mécanisme SSH lui-même. Un souci ici ne doit pas annuler tout le durcissement
+    # SSH/firewall déjà appliqué et fonctionnel (le "||" empêche que ça déclenche le rollback).
+    manage_service fail2ban restart || show_warn "Le redémarrage de fail2ban a échoué, vérifiez manuellement : systemctl status fail2ban"
+    manage_service fail2ban enable || show_warn "L'activation au démarrage de fail2ban a échoué, vérifiez manuellement : systemctl status fail2ban"
 
     show_success "✅ Fail2Ban configuré pour SSH."
 fi
