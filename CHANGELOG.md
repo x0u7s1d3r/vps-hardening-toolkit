@@ -2,6 +2,12 @@
 
 Toutes les évolutions notables de ce projet sont documentées ici. Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [1.3.1] - 2026-08-17
+
+### Corrigé (régression introduite par le correctif d'idempotence de la 1.3.0)
+
+- La nouvelle détection `CURRENT_SSH_PORT=$(sshd -T ...)` (ajoutée en 1.3.0 pour l'idempotence) plantait le script dès son tout premier lancement sur un système où `sshd` n'a pas encore de clé d'hôte générée (`sshd -T` renvoie alors le code 1, "no hostkeys available") — le cas typique d'un conteneur fraîchement installé sans init réel (exactement les jobs CI `dry-run-rhel`/`dry-run-arch`, repérés en quelques minutes après le déploiement de la 1.3.0). `set -e`/pipefail propageaient cet échec AVANT que `NEW_USER` ne soit défini, ce qui déclenchait `rollback()` ... qui plantait à son tour en référençant `$NEW_USER`, encore non défini, sous `set -u`. Corrigé à deux niveaux : (1) l'échec de `sshd -T` est maintenant explicitement toléré (`|| true`) et traité comme "aucun port SSH actuel connu", ce qui est le comportement correct ; (2) `rollback()` lui-même a été rendu robuste à un déclenchement avant que `NEW_USER` ne soit défini, quelle qu'en soit la cause — le filet de sécurité du script ne doit jamais planter lui-même. Reproduit et vérifié en local (host keys temporairement retirées) avant publication.
+
 ## [1.3.0] - 2026-08-17
 
 ### Corrigé (sécurité / RHEL-family)

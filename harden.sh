@@ -21,7 +21,7 @@
 # ". /etc/os-release" plus loin pour lire $ID -- ce qui écraserait silencieusement notre
 # propre numéro de version si on utilisait le même nom (bug réel constaté : la bannière et
 # --help affichaient la version d'Ubuntu au lieu de celle du script).
-TOOLKIT_VERSION="1.3.0"
+TOOLKIT_VERSION="1.3.1"
 
 set -e  # Arrête le script en cas d'erreur (voir gestion du trap ERR plus bas)
 set -u  # Erreur si variable non définie utilisée
@@ -453,7 +453,17 @@ rollback() {
                 ;;
         esac
     done
-    show_success "✅ Rollback terminé. L'utilisateur '$NEW_USER' et sa clé SSH ne sont pas supprimés automatiquement (au cas où) : supprimez-les manuellement avec 'deluser $NEW_USER' si besoin."
+    # "${NEW_USER:-}" (et non "$NEW_USER") : rollback() peut être déclenché par une
+    # erreur survenue AVANT que NEW_USER ne soit défini (ex: précheck, détection de
+    # distribution/service). rollback() est le filet de sécurité du script : il ne doit
+    # jamais planter lui-même, quelle que soit la précocité de l'erreur d'origine -- avec
+    # "set -u" actif, référencer une variable non définie ici ferait planter le rollback
+    # au moment même où on en a le plus besoin (bug réel constaté sur ce projet).
+    if [[ -n "${NEW_USER:-}" ]]; then
+        show_success "✅ Rollback terminé. L'utilisateur '$NEW_USER' et sa clé SSH ne sont pas supprimés automatiquement (au cas où) : supprimez-les manuellement avec 'deluser $NEW_USER' si besoin."
+    else
+        show_success "✅ Rollback terminé (l'erreur est survenue avant la création de l'utilisateur : rien à nettoyer de ce côté)."
+    fi
     exit 1
 }
 
@@ -579,7 +589,14 @@ fi
 # validate_port(), le port qu'on s'apprête à reconfigurer : sans ça, relancer le script
 # une seconde fois avec le même --ssh-port échoue toujours, car ce port est déjà "in use"
 # par... le sshd que le script lui-même a configuré au tour précédent.
-CURRENT_SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+# "|| true" : "sshd -T" échoue (code 1, "no hostkeys available") tant qu'aucune clé
+# d'hôte SSH n'a encore été générée -- le cas sur une image/conteneur tout juste
+# installé où le générateur de clés n'a jamais tourné (pas de service init réel). Sans
+# ce garde-fou, "set -e"/pipefail feraient échouer le script ici même, AVANT que
+# NEW_USER ne soit défini -- ce qui ferait planter rollback() lui-même (cf. plus bas).
+# Un échec ici signifie simplement "aucun port SSH actuel connu", ce qui est le
+# comportement de repli correct.
+CURRENT_SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}') || true
 
 # === Collecte des informations ===
 if [[ -t 1 ]]; then
