@@ -63,7 +63,12 @@ sudo ./harden.sh --non-interactive \
 
 Chaque exécution est journalisée dans `/var/log/vps-hardening-toolkit.log`.
 
-Le pipeline CI (`.github/workflows/ci.yml`) fait tourner shellcheck sur chaque push, puis exécute réellement le script en mode non-interactif sur un runner Ubuntu jetable et vérifie le résultat (connexion SSH par clé fonctionnelle, root et mot de passe désactivés, firewall actif, fail2ban actif).
+Le pipeline CI (`.github/workflows/ci.yml`) tourne sur chaque push/PR et comprend 5 jobs indépendants :
+
+- **lint** : shellcheck + vérification syntaxique.
+- **integration-test** : exécution réelle et complète du script en mode non-interactif sur un runner Ubuntu jetable (connexion SSH par clé fonctionnelle, root et mot de passe désactivés, firewall actif, fail2ban actif).
+- **rollback-test** : simule un échec constaté par l'utilisateur (réponse "non" à la confirmation finale) et vérifie que `rollback()` restaure bien `sshd_config`, désactive le firewall, retire l'entrée sudoers, les drop-ins sysctl et la config fail2ban — le mécanisme anti-lockout le plus critique du script est donc lui-même testé, pas seulement relu.
+- **dry-run-rhel** / **dry-run-arch** : exécutent réellement (pas en théorie) la détection de distribution, la sélection dnf/pacman et firewalld/ufw, et surtout la détection du service SSH sur Rocky Linux et Arch Linux, en mode `--dry-run`. Ces deux jobs tournent dans un conteneur Docker simple (pas de vrai `systemd` en PID 1), donc ils ne couvrent pas le redémarrage réel des services comme le fait `integration-test` sur Ubuntu — c'est une limite assumée, pas cachée.
 
 ## Avertissements
 

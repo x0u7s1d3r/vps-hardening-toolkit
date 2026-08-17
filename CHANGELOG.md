@@ -2,6 +2,17 @@
 
 Toutes les évolutions notables de ce projet sont documentées ici. Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
+## [1.2.0] - 2026-08-17
+
+### Ajouté
+
+- Job CI `rollback-test` : simule un échec constaté par l'utilisateur (réponse "non" à la confirmation finale de `harden.sh`) et vérifie que `rollback()` restaure réellement `sshd_config` à l'identique, désactive le firewall, retire l'entrée sudoers créée, les drop-ins sysctl IPv6/ICMP et la configuration fail2ban. Ce mécanisme anti-lockout, jusqu'ici seulement relu, est maintenant exécuté pour de vrai à chaque push/PR.
+- Jobs CI `dry-run-rhel` (Rocky Linux 9, conteneur `rockylinux:9`) et `dry-run-arch` (`archlinux:latest`) : exécutent réellement le script en `--dry-run --non-interactive` dans un conteneur de chaque distribution, exerçant pour de vrai la détection de distribution, la sélection `dnf`/`pacman` et `firewalld`/`ufw`, et la détection du service SSH sur ces deux familles (jusqu'ici jamais exécutées par la CI, seulement par Ubuntu). Limite assumée et documentée : pas de vrai `systemd` en PID 1 dans ces conteneurs, donc pas de test du redémarrage réel des services comme sur Ubuntu.
+
+### Modifié
+
+- Tous les appels à `systemctl` (détection du service SSH, `manage_service()`) sont désormais protégés par un `timeout` (10s pour la détection, 30s pour les actions), pour ne jamais bloquer indéfiniment le script sur un bus systemd injoignable (environnement conteneurisé sans init réel, notamment).
+
 ## [1.1.0] - 2026-08-17
 
 ### Ajouté

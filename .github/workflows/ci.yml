@@ -89,3 +89,164 @@ jobs:
 
       - name: Vérifier le journal de sortie du script
         run: sudo test -s /var/log/vps-hardening-toolkit.log
+
+  rollback-test:
+    name: Test du rollback (échec simulé -> restauration)
+    runs-on: ubuntu-latest
+    # Job indépendant du précédent : tourne sur son propre runner jetable, donc aucun
+    # conflit avec le port/utilisateur déjà utilisés par integration-test.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Préparer un environnement type "VPS tout neuf" (sshd présent et actif)
+        run: |
+          sudo apt-get update -y
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y openssh-server
+          sudo systemctl enable --now ssh
+
+      - name: Générer une clé SSH jetable pour le test
+        run: ssh-keygen -t ed25519 -f /tmp/testkey -N "" -C "ci-rollback-test"
+
+      - name: Rendre le script exécutable
+        run: chmod +x harden.sh
+
+      - name: Sauvegarder l'état initial (sshd_config) avant durcissement, pour comparaison après rollback
+        run: sudo cp /etc/ssh/sshd_config /tmp/sshd_config.orig
+
+      - name: >
+          Lancer harden.sh en mode interactif et répondre "non" à la confirmation finale
+          (simule un utilisateur qui constate un problème -> doit déclencher rollback())
+        run: |
+          # On NE passe PAS --non-interactive : le script pose donc ses questions
+          # habituelles sur stdin. Chaque valeur passée en argument devient la valeur par
+          # défaut du prompt correspondant, donc une ligne vide = "j'accepte le défaut".
+          # --pubkey étant fourni, aucune question n'est posée sur la clé (branche sautée).
+          # Il y a exactement 6 prompts de configuration + 1 confirmation finale = 7 lignes.
+          # On répond "non" à la toute dernière (la confirmation), ce qui appelle
+          # directement rollback() dans le script, exactement comme un vrai utilisateur qui
+          # constate que la nouvelle connexion SSH ne fonctionne pas.
+          set +e
+          printf '\n\n\n\n\n\nnon\n' | sudo ./harden.sh \
+            --user rollbacktest \
+            --ssh-port 2299 \
+            --allowed-ips "" \
+            --pubkey "$(cat /tmp/testkey.pub)" \
+            --disable-ipv6 oui \
+            --limit-icmp oui \
+            --sudo-nopasswd non
+          echo "EXIT_CODE=$?" >> "$GITHUB_ENV"
+          set -e
+
+      - name: Vérifier que le script s'est terminé avec le code attendu (rollback = exit 1)
+        run: |
+          echo "Code de sortie de harden.sh : $EXIT_CODE"
+          test "$EXIT_CODE" -eq 1
+
+      - name: Vérifier que sshd_config a été restauré à l'identique de l'original
+        run: sudo diff /etc/ssh/sshd_config /tmp/sshd_config.orig
+
+      - name: Vérifier que sshd est valide et répond sur le port d'origine (22)
+        run: |
+          sleep 2
+          sudo sshd -t
+          sudo sshd -T | grep -iE "^port 22$"
+
+      - name: Vérifier que le firewall a été désactivé par le rollback
+        run: |
+          sudo ufw status | grep -q "Status: inactive"
+
+      - name: Vérifier que l'entrée sudoers créée pour ce test a été retirée
+        run: sudo test ! -f /etc/sudoers.d/rollbacktest
+
+      - name: Vérifier que les drop-ins sysctl (IPv6/ICMP) ont été retirés
+        run: |
+          sudo test ! -f /etc/sysctl.d/90-vps-hardening-ipv6.conf
+          sudo test ! -f /etc/sysctl.d/90-vps-hardening-icmp.conf
+
+      - name: Vérifier que la configuration fail2ban a été retirée
+        run: sudo test ! -f /etc/fail2ban/jail.local
+
+  dry-run-rhel:
+    name: Test à blanc (dry-run) sur RHEL-like (Rocky Linux 9)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    # Ce job ne fait PAS un test d'intégration complet comme integration-test : un
+    # conteneur Docker classique n'a pas de vrai processus systemd en PID 1 (pas de bus
+    # DBus joignable), donc redémarrer un vrai service SSH/firewalld dedans n'est pas
+    # représentatif. Il valide en revanche, pour de vrai (pas en théorie), tout ce qui
+    # peut l'être sans service manager fonctionnel : détection de la distribution,
+    # sélection dnf/firewalld, et surtout la détection du service SSH (le point qui a
+    # justement causé un vrai bug CI sur la branche Debian/Ubuntu de ce projet).
+    timeout-minutes: 15
+    steps:
+      - name: Installer git (requis par actions/checkout)
+        run: dnf install -y git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Installer les paquets nécessaires au test (SSH, outils réseau, systemd)
+        run: dnf install -y openssh-server openssh-clients iproute systemd
+
+      - name: Générer une clé SSH jetable pour le test
+        run: ssh-keygen -t ed25519 -f /tmp/testkey -N "" -C "ci-rhel-test"
+
+      - name: Rendre le script exécutable
+        run: chmod +x harden.sh
+
+      - name: Sauvegarder sshd_config avant exécution
+        run: cp /etc/ssh/sshd_config /tmp/sshd_config.before
+
+      - name: Exécuter harden.sh en --dry-run --non-interactive (chemin RHEL exercé pour de vrai)
+        run: |
+          ./harden.sh --non-interactive --dry-run \
+            --user citest --ssh-port 2222 --pubkey "$(cat /tmp/testkey.pub)" \
+            --allowed-ips "" --disable-ipv6 oui --limit-icmp oui --sudo-nopasswd non
+
+      - name: Vérifier qu'aucune modification n'a été appliquée à sshd_config
+        run: diff /etc/ssh/sshd_config /tmp/sshd_config.before
+
+      - name: Vérifier que le firewall détecté est bien firewalld (branche RHEL du script)
+        run: grep -qi "firewalld" /var/log/vps-hardening-toolkit.log
+
+  dry-run-arch:
+    name: Test à blanc (dry-run) sur Arch Linux
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    # Mêmes limites et mêmes objectifs que le job RHEL ci-dessus (pas de systemd PID 1
+    # dans un conteneur Docker classique) : on valide réellement la détection de
+    # distribution, la sélection pacman/ufw, et la détection du service SSH sur Arch.
+    timeout-minutes: 15
+    steps:
+      - name: >
+          Installer git et les paquets nécessaires (pacman -Syu --needed, cf.
+          l'avertissement du script lui-même sur les "partial upgrades" Arch)
+        run: pacman -Syu --noconfirm --needed git openssh iproute2 systemd
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Générer une clé SSH jetable pour le test
+        run: ssh-keygen -t ed25519 -f /tmp/testkey -N "" -C "ci-arch-test"
+
+      - name: Rendre le script exécutable
+        run: chmod +x harden.sh
+
+      - name: Sauvegarder sshd_config avant exécution
+        run: cp /etc/ssh/sshd_config /tmp/sshd_config.before
+
+      - name: Exécuter harden.sh en --dry-run --non-interactive (chemin Arch exercé pour de vrai)
+        run: |
+          ./harden.sh --non-interactive --dry-run \
+            --user citest --ssh-port 2222 --pubkey "$(cat /tmp/testkey.pub)" \
+            --allowed-ips "" --disable-ipv6 oui --limit-icmp oui --sudo-nopasswd non
+
+      - name: Vérifier qu'aucune modification n'a été appliquée à sshd_config
+        run: diff /etc/ssh/sshd_config /tmp/sshd_config.before
+
+      - name: Vérifier que le firewall détecté est bien ufw (branche Arch du script)
+        run: grep -qi "ufw" /var/log/vps-hardening-toolkit.log

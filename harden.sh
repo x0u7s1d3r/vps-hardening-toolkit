@@ -16,7 +16,7 @@
 #   Usage : sudo ./harden.sh [options]   (voir --help)
 # ============================================================================
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 set -e  # Arrête le script en cas d'erreur (voir gestion du trap ERR plus bas)
 set -u  # Erreur si variable non définie utilisée
@@ -303,8 +303,11 @@ check_ssh_port() {
 manage_service() {
     local service_name="$1" action="$2" rc
 
-    if command -v systemctl &>/dev/null && systemctl list-units --full -all 2>/dev/null | grep -q "${service_name}\.service"; then
-        systemctl "$action" "$service_name" &>/dev/null
+    if command -v systemctl &>/dev/null && timeout 10 systemctl list-units --full -all 2>/dev/null | grep -q "${service_name}\.service"; then
+        # "timeout 30" : filet de sécurité si systemctl reste bloqué (bus systemd
+        # injoignable, environnement conteneurisé sans init réel...) plutôt que de
+        # bloquer le script indéfiniment sur un simple restart/enable de service.
+        timeout 30 systemctl "$action" "$service_name" &>/dev/null
         rc=$?
     elif command -v service &>/dev/null && service --status-all 2>/dev/null | grep -q "$service_name"; then
         service "$service_name" "$action" &>/dev/null
@@ -489,9 +492,15 @@ if command -v systemctl &>/dev/null; then
     # peuvent varier juste après une installation/activation selon le système). En
     # complément, on vérifie aussi directement la présence du fichier d'unité sur le
     # disque, au cas où systemctl se comporterait différemment sur une distribution donnée.
-    if systemctl list-unit-files --type=service 2>/dev/null | grep -qE '^ssh\.service\b' || unit_file_exists "ssh.service"; then
+    # "timeout 10" : sur un système sans bus systemd joignable (conteneur sans init réel,
+    # par exemple les jobs CI RHEL/Arch qui tournent dans un simple conteneur Docker),
+    # systemctl échoue normalement très vite ("Failed to connect to bus"), mais on se
+    # protège quand même d'un blocage éventuel plutôt que de dépendre uniquement de ce
+    # comportement. Le fallback unit_file_exists() (lecture directe sur disque) ne dépend
+    # lui d'aucun bus et fonctionne dans tous les cas.
+    if timeout 10 systemctl list-unit-files --type=service 2>/dev/null | grep -qE '^ssh\.service\b' || unit_file_exists "ssh.service"; then
         SSH_SERVICE="ssh"
-    elif systemctl list-unit-files --type=service 2>/dev/null | grep -qE '^sshd\.service\b' || unit_file_exists "sshd.service"; then
+    elif timeout 10 systemctl list-unit-files --type=service 2>/dev/null | grep -qE '^sshd\.service\b' || unit_file_exists "sshd.service"; then
         SSH_SERVICE="sshd"
     else
         show_error "Impossible de détecter le service SSH. Script interrompu."
